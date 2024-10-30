@@ -28,40 +28,33 @@ redis_client = redis.StrictRedis(
 
 
 def process_message(channel, method, properties, body):
-    message = json.loads(body)
-    print(message)
-    key = message.get("key")
-    value = message.get("value")
-    create_if_not = message.get("createIfNot", False)
-    ttl = message.get("ttl", None)
-
     try:
-        # Проверяем, существует ли ключ в Redis
+        message = json.loads(body)
+        key = message.get("key")
+        value = message.get("value")
+        create_if_not = message.get("createIfNot", False)
+        ttl = message.get("ttl", None)
+
+        # Проверка существования ключа в Redis
         if not redis_client.exists(key):
             if create_if_not:
-                # Сохраняем значение как JSON
                 redis_client.json().set(key, '.', value)
                 if ttl:
                     redis_client.expire(key, ttl)
-
-        # Получаем текущее значение
-        current_value = redis_client.json().get(key)
-
-        # Обновляем текущее значение
-        current_value.update(value)
-        redis_client.json().set(key, '.', current_value)  # Сохраняем как JSON
-
-        # Устанавливаем TTL, если передан
-        if ttl:
-            redis_client.expire(key, ttl)
+        else:
+            # Если ключ существует, обновляем текущие данные
+            current_value = redis_client.json().get(key)
+            current_value.update(value)
+            redis_client.json().set(key, '.', current_value)
+            if ttl:
+                redis_client.expire(key, ttl)
 
         # Подтверждаем успешную обработку сообщения
         channel.basic_ack(delivery_tag=method.delivery_tag)
 
     except Exception as e:
         print(f"Error processing message: {e}")
-        # Если произошла ошибка, вы можете решить, что делать с сообщением (например, переотправить его)
-        channel.basic_nack(delivery_tag=method.delivery_tag, requeue=True)
+        # channel.basic_nack(delivery_tag=method.delivery_tag, requeue=True)
 
 
 # Создание подключения к RabbitMQ
