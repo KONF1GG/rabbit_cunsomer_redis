@@ -1,72 +1,113 @@
+import datetime
 import pika
 import redis
+import clickhouse_connect
 import json
 from dotenv import dotenv_values
 
-config = dotenv_values()
+config = dotenv_values('.env')
 
-# Настройки для RabbitMQ
-rabbitmq_host = config.get('RABBIT_HOST')
-queue_name = config.get('QUEUE_NAME')
-rabbit_user = config.get('RABBIT_USER')
-rabbit_password = config.get('RABBIT_PASSWORD')
+# Настройки RabbitMQ
+RABBIT_HOST = config.get('RABBIT_HOST')
+RABBIT_USER = config.get('RABBIT_USER')
+RABBIT_PASSWORD = config.get('RABBIT_PASSWORD')
+QUEUE_NAME = config.get('QUEUE_NAME')
+ERROR_QUEUE_NAME = 'error_queue'
 
-# Настройки для Redis
-redis_host = config.get('REDIS_HOST')
-redis_port = config.get('REDIS_PORT')
-redis_username = config.get('REDIS_USERNAME')
-redis_password = config.get('REDIS_PASSWORD')
+# Настройки Redis
+REDIS_HOST = config.get('REDIS_HOST')
+REDIS_PORT = config.get('REDIS_PORT')
+REDIS_PASSWORD = config.get('REDIS_PASSWORD')
 
-# Подключаемся к Redis с поддержкой RedisJSON
+# Настройки ClickHouse
+CLICKHOUSE_HOST = config.get('HOST')
+CLICKHOUSE_PORT = config.get('PORT')
+CLICKHOUSE_DATABASE = config.get('DATABASE')
+CLICKHOUSE_USER = config.get('USER')
+CLICKHOUSE_PASSWORD = config.get('PASSWORD')
+
+# Подключение к Redis с поддержкой RedisJSON
 redis_client = redis.StrictRedis(
-    host=redis_host,
-    port=redis_port,
-    username=redis_username,
-    password=redis_password,
+    host=REDIS_HOST,
+    port=REDIS_PORT,
+    password=REDIS_PASSWORD,
     decode_responses=True
 )
 
 
-def process_message(channel, method, properties, body):
-    try:
-        message = json.loads(body)
-        key = message.get("key")
-        value = message.get("value")
-        create_if_not = message.get("createIfNot", False)
-        ttl = message.get("ttl", None)
+def log_to_clickhouse(client, key, message_data, status='success', error=None):
+    query = f"""
+    INSERT INTO rabbitmq.logs (key, payload, status, error, timestamp)
+    VALUES ('{key}', '{json.dumps(message_data)}', '{status}', '{error}', '{datetime.datetime.now()}')
+    """
+    client.command(query)
 
-        # Проверка существования ключа в Redis
-        if not redis_client.exists(key):
-            if create_if_not:
-                redis_client.json().set(key, '.', value)
-                if ttl:
-                    redis_client.expire(key, ttl)
-        else:
-            # Если ключ существует, обновляем текущие данные
+
+def process_message(ch, method, properties, body, redis_client, clickhouse_client):
+    message_data = json.loads(body)
+    key = message_data.get('key')
+    create_if_not = message_data.get('createIfNot', True)
+
+    try:
+        value = message_data.get('value', {})
+
+        if redis_client.exists(key):
             current_value = redis_client.json().get(key)
             current_value.update(value)
             redis_client.json().set(key, '.', current_value)
-            if ttl:
-                redis_client.expire(key, ttl)
+            status = 'updated'
+        else:
+            if create_if_not:
+                redis_client.json().set(key, '.', value)
+                status = 'inserted'
+            else:
+                status = 'skipped'
 
-        # Подтверждаем успешную обработку сообщения
-        channel.basic_ack(delivery_tag=method.delivery_tag)
+        log_to_clickhouse(clickhouse_client, key, message_data, status=status)
 
     except Exception as e:
         print(f"Error processing message: {e}")
-        # channel.basic_nack(delivery_tag=method.delivery_tag, requeue=True)
+        log_to_clickhouse(clickhouse_client, key, message_data, status='error', error=str(e))
+
+        # Перенаправление сообщения в другую очередь
+        ch.basic_publish(
+            exchange='',
+            routing_key=ERROR_QUEUE_NAME,
+            body=body,
+            properties=pika.BasicProperties(
+                delivery_mode=2,
+            )
+        )
 
 
-# Создание подключения к RabbitMQ
-credentials = pika.PlainCredentials(rabbit_user, rabbit_password)
-connection = pika.BlockingConnection(pika.ConnectionParameters(host=rabbitmq_host, credentials=credentials))
-channel = connection.channel()
+def main():
+    # Подключение к ClickHouse
+    clickhouse_client = clickhouse_connect.get_client(
+        host=CLICKHOUSE_HOST,
+        username=CLICKHOUSE_USER,
+        password=CLICKHOUSE_PASSWORD
+    )
 
-# Подписываемся на очередь
-channel.queue_declare(queue=queue_name, durable=True)
+    # Подключение к RabbitMQ
+    connection = pika.BlockingConnection(
+        pika.ConnectionParameters(
+            host=RABBIT_HOST,
+            credentials=pika.PlainCredentials(RABBIT_USER, RABBIT_PASSWORD)
+        )
+    )
 
-# Подключаем consumer
-channel.basic_consume(queue=queue_name, on_message_callback=process_message)
+    channel = connection.channel()
+    channel.queue_declare(queue=QUEUE_NAME, durable=True)
+    channel.queue_declare(queue=ERROR_QUEUE_NAME, durable=True)
 
-print(f"Waiting for messages in {queue_name}. To exit press CTRL+C")
-channel.start_consuming()
+    def callback(ch, method, properties, body):
+        process_message(ch, method, properties, body, redis_client, clickhouse_client)
+
+    channel.basic_consume(queue=QUEUE_NAME, on_message_callback=callback, auto_ack=True)
+
+    print("Waiting for messages. To exit press CTRL+C")
+    channel.start_consuming()
+
+
+if __name__ == '__main__':
+    main()
