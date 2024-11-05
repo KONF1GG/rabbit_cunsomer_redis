@@ -20,13 +20,12 @@ channel.queue_declare(queue=queue_name, durable=True)
 
 # Создаем сообщение
 message = {
-    "key": "login:ngvpn10532",
+    "key": "login:test",
     "value": {
-        "field1": "value1",
+        "field1": "value3",
         "field2": "value2"
     },
     "createIfNot": True,
-    "ttl": 60000
 }
 
 # Преобразуем сообщение в JSON
