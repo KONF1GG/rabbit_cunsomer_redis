@@ -105,7 +105,11 @@ def setup_rabbitmq_channel():
                 )
             )
             channel = connection.channel()
-            channel.queue_declare(queue=QUEUE_NAME, durable=True)
+            channel.queue_declare(
+                queue=QUEUE_NAME,
+                durable=True,
+                arguments={'x-message-ttl': 86400000}
+            )
             return connection, channel
         except pika.exceptions.AMQPConnectionError as e:
             print(f"Connection error: {e}. Retrying in 5 seconds...")
