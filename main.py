@@ -6,6 +6,8 @@ import json
 import time
 from threading import Thread
 from dotenv import dotenv_values
+import psycopg2
+from psycopg2.extras import RealDictCursor
 
 config = dotenv_values('.env')
 
@@ -26,6 +28,13 @@ CLICKHOUSE_PORT = config.get('PORT')
 CLICKHOUSE_DATABASE = config.get('DATABASE')
 CLICKHOUSE_USER = config.get('USER')
 CLICKHOUSE_PASSWORD = config.get('PASSWORD')
+
+# Настройки PostgreSQL
+POSTGRES_HOST = config.get('RBT_HOST')
+POSTGRES_PORT = config.get('RBT_PORT')
+POSTGRES_USER = config.get('RBT_USER')
+POSTGRES_PASSWORD = config.get('RBT_PASSWORD')
+POSTGRES_DATABASE = config.get('RBT_DATABASE')
 
 redis_client = redis.StrictRedis(
     host=REDIS_HOST,
@@ -51,29 +60,86 @@ def log_to_clickhouse(client, key, message_data, status='success', error=None):
     client.command(query)
 
 
+def check_rbt_status(phone):
+    """
+    Проверяет статус RBT для заданного номера телефона в базе данных.
+    Возвращает True, если запись найдена и актуальна, иначе False.
+    """
+    connection = None
+    try:
+        connection = psycopg2.connect(
+            host=POSTGRES_HOST,
+            port=POSTGRES_PORT,
+            database=POSTGRES_DATABASE,
+            user=POSTGRES_USER,
+            password=POSTGRES_PASSWORD
+        )
+        with connection.cursor(cursor_factory=RealDictCursor) as cursor:
+            query = f"SELECT last_seen, auth_token, house_subscriber_id FROM houses_subscribers_mobile WHERE id = '7{phone}';"
+            cursor.execute(query)
+            result = cursor.fetchone()
+
+            if result:
+                last_seen = result['last_seen']
+
+                last_seen = datetime.datetime.fromtimestamp(last_seen)
+
+                # Сравнение с текущей датой минус 90 дней
+                three_months_ago = datetime.datetime.now() - datetime.timedelta(days=90)
+                if last_seen > three_months_ago:
+                    return result
+                else:
+                    return None
+
+    except Exception as e:
+        print(f"Error querying RBT database: {e}")
+        return False
+    finally:
+        if connection:
+            connection.close()
+
+
 def process_message(ch, method, properties, body, redis_client, clickhouse_client):
     global last_message_time
-    last_message_time = time.time()  # обновляем время последнего сообщения
+    last_message_time = time.time()
     message_data = json.loads(body)
+
     key = message_data.get('key')
     create_if_not = message_data.get('createIfNot', True)
     ttl = message_data.get('ttl', None)
+    replace = message_data.get('replace', False)
 
     try:
         value = message_data.get('value', {})
         status = None
 
+        # Проверяем ключ на соответствие phone:...
+        if key.startswith('phone:'):
+            phone = key.split(':', 1)[1]
+            rbt_result = check_rbt_status(phone)
+            if rbt_result:
+                value['rbt'] = True
+                value['auth_token'] = rbt_result['auth_token']
+                value['house_subscriber_id'] = rbt_result['house_subscriber_id']
+            else:
+                value['rbt'] = False
         if redis_client.exists(key):
-            # Пытаемся обновить существующее значение
-            current_value = redis_client.json().get(key)
-            current_value.update(value)
-            success = redis_client.json().set(key, '.', current_value)
-            if ttl and success:
-                redis_client.expire(key, ttl)
-            status = 'updated' if success else 'failed_to_update'
+            if replace:
+                # Полностью заменить данные
+                success = redis_client.json().set(key, '.', value)
+                if ttl and success:
+                    redis_client.expire(key, ttl)
+                status = 'replaced' if success else 'failed_to_replace'
+            else:
+                # Обновить существующие данные
+                current_value = redis_client.json().get(key)
+                current_value.update(value)
+                success = redis_client.json().set(key, '.', current_value)
+                if ttl and success:
+                    redis_client.expire(key, ttl)
+                status = 'updated' if success else 'failed_to_update'
         else:
             if create_if_not:
-                # Пытаемся вставить новое значение
                 success = redis_client.json().set(key, '.', value)
                 if ttl and success:
                     redis_client.expire(key, ttl)
@@ -81,18 +147,16 @@ def process_message(ch, method, properties, body, redis_client, clickhouse_clien
             else:
                 status = 'skipped'
 
-        if status in {'inserted', 'updated'}:
+        if status in {'inserted', 'updated', 'replaced'}:
             log_to_clickhouse(clickhouse_client, key, message_data, status=status)
-            ch.basic_ack(delivery_tag=method.delivery_tag)  # Подтверждаем только если обновление прошло успешно
+            ch.basic_ack(delivery_tag=method.delivery_tag)
         else:
-            # Логируем ошибку, если вставка или обновление не прошли
-            error_message = f"Failed to {'inserted' if status == 'failed_to_insert' else 'updated'} message in Redis."
+            error_message = f"Failed to {'insert' if status == 'failed_to_insert' else 'update' if status == 'failed_to_update' else 'replace'} message in Redis."
             log_to_clickhouse(clickhouse_client, key, message_data, status='error', error=error_message)
 
     except Exception as e:
         print(f"Error processing message: {e}")
         log_to_clickhouse(clickhouse_client, key, message_data, status='error', error=str(e))
-        # Сообщение не подтверждается и останется в очереди для повторной обработки
 
 
 def setup_rabbitmq_channel():
@@ -117,11 +181,10 @@ def setup_rabbitmq_channel():
 
 
 def monitor_connection(channel):
-    """Функция для перезапуска подключения, если сообщений нет более минуты."""
     global last_message_time
     while True:
-        if time.time() - last_message_time > 60:
-            print("No messages received in the last minute. Reconnecting...")
+        if time.time() - last_message_time > 600:
+            print("No messages received in the last 10 minutes. Reconnecting...")
             if channel.is_open:
                 channel.stop_consuming()
             break
@@ -139,13 +202,15 @@ def main():
     while True:
         connection, channel = setup_rabbitmq_channel()
 
-        # Обработчик основной очереди
         def callback(ch, method, properties, body):
-            process_message(ch, method, properties, body, redis_client, clickhouse_client)
+            try:
+                process_message(ch, method, properties, body, redis_client, clickhouse_client)
+            except Exception as e:
+                print(f"Callback error: {e}. Re-queueing message.")
+                ch.basic_nack(delivery_tag=method.delivery_tag, requeue=True)
 
         channel.basic_consume(queue=QUEUE_NAME, on_message_callback=callback, auto_ack=False)
 
-        # Запускаем мониторинг активности сообщений
         monitor_thread = Thread(target=monitor_connection, args=(channel,))
         monitor_thread.start()
 
