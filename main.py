@@ -155,7 +155,7 @@ def process_message(ch, method, properties, body, redis_client, clickhouse_clien
             log_to_clickhouse(clickhouse_client, key, message_data, status='error', error=error_message)
 
     except Exception as e:
-        print(f"Error processing message: {e}")
+        # print(f"Error processing message: {e}")
         log_to_clickhouse(clickhouse_client, key, message_data, status='error', error=str(e))
 
 
@@ -176,7 +176,7 @@ def setup_rabbitmq_channel():
             )
             return connection, channel
         except pika.exceptions.AMQPConnectionError as e:
-            print(f"Connection error: {e}. Retrying in 5 seconds...")
+            # print(f"Connection error: {e}. Retrying in 5 seconds...")
             time.sleep(5)
 
 
@@ -184,7 +184,7 @@ def monitor_connection(channel):
     global last_message_time
     while True:
         if time.time() - last_message_time > 600:
-            print("No messages received in the last 10 minutes. Reconnecting...")
+            # print("No messages received in the last 10 minutes. Reconnecting...")
             if channel.is_open:
                 channel.stop_consuming()
             break
@@ -214,15 +214,15 @@ def main():
         monitor_thread = Thread(target=monitor_connection, args=(channel,))
         monitor_thread.start()
 
-        print("Waiting for messages. To exit press CTRL+C")
+        # print("Waiting for messages. To exit press CTRL+C")
         try:
             channel.start_consuming()
             last_message_time = time.time()
         except pika.exceptions.ConnectionClosed:
-            print("Connection lost. Attempting to reconnect...")
+            # print("Connection lost. Attempting to reconnect...")
             continue
         except pika.exceptions.StreamLostError as e:
-            print(f"Stream lost: {e}. Attempting to reconnect...")
+            # print(f"Stream lost: {e}. Attempting to reconnect...")
             continue
         finally:
             if connection.is_open:
