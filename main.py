@@ -8,6 +8,7 @@ from threading import Thread
 from dotenv import dotenv_values
 import psycopg2
 from psycopg2.extras import RealDictCursor
+import requests
 
 config = dotenv_values('.env')
 
@@ -43,7 +44,20 @@ redis_client = redis.StrictRedis(
     decode_responses=True
 )
 
+API_TOKEN = config.get('API_TOKEN')
+CHAT_ID = config.get('CHAT_ID')
+
 last_message_time = time.time()
+
+def send_telegram_message(message):
+    url = f'https://api.telegram.org/bot{API_TOKEN}/sendMessage'
+    data = {'chat_id': CHAT_ID, 'text': message}
+    try:
+        response = requests.post(url, data=data)
+        if response.status_code != 200:
+            print(f"Ошибка отправки уведомления: {response.status_code}, {response.text}")
+    except Exception as e:
+        print(f"Ошибка при отправке уведомления: {e}")
 
 
 def log_to_clickhouse(client, key, message_data, status='success', error=None):
@@ -92,7 +106,6 @@ def check_rbt_status(phone):
                     return None
 
     except Exception as e:
-        print(f"Error querying RBT database: {e}")
         return False
     finally:
         if connection:
@@ -117,6 +130,10 @@ def process_message(ch, method, properties, body, redis_client, clickhouse_clien
         if key.startswith('phone:'):
             phone = key.split(':', 1)[1]
             rbt_result = check_rbt_status(phone)
+            if rbt_result == False:
+                log_to_clickhouse(clickhouse_client, key, message_data, status='error', error='RBT faild')
+                send_telegram_message('RBT faild')
+                return 0
             if rbt_result:
                 value['rbt'] = True
                 value['auth_token'] = rbt_result['auth_token']
@@ -153,10 +170,12 @@ def process_message(ch, method, properties, body, redis_client, clickhouse_clien
         else:
             error_message = f"Failed to {'insert' if status == 'failed_to_insert' else 'update' if status == 'failed_to_update' else 'replace'} message in Redis."
             log_to_clickhouse(clickhouse_client, key, message_data, status='error', error=error_message)
+            send_telegram_message(error_message)
 
     except Exception as e:
         # print(f"Error processing message: {e}")
         log_to_clickhouse(clickhouse_client, key, message_data, status='error', error=str(e))
+        send_telegram_message(error_message)
 
 
 def setup_rabbitmq_channel():
@@ -176,7 +195,7 @@ def setup_rabbitmq_channel():
             )
             return connection, channel
         except pika.exceptions.AMQPConnectionError as e:
-            # print(f"Connection error: {e}. Retrying in 5 seconds...")
+            print(f"Connection error: {e}. Retrying in 5 seconds...")
             time.sleep(5)
 
 
@@ -184,7 +203,7 @@ def monitor_connection(channel):
     global last_message_time
     while True:
         if time.time() - last_message_time > 600:
-            # print("No messages received in the last 10 minutes. Reconnecting...")
+            print("No messages received in the last 10 minutes. Reconnecting...")
             if channel.is_open:
                 channel.stop_consuming()
             break
@@ -214,15 +233,15 @@ def main():
         monitor_thread = Thread(target=monitor_connection, args=(channel,))
         monitor_thread.start()
 
-        # print("Waiting for messages. To exit press CTRL+C")
+        print("Waiting for messages. To exit press CTRL+C")
         try:
             channel.start_consuming()
             last_message_time = time.time()
         except pika.exceptions.ConnectionClosed:
-            # print("Connection lost. Attempting to reconnect...")
+            print("Connection lost. Attempting to reconnect...")
             continue
         except pika.exceptions.StreamLostError as e:
-            # print(f"Stream lost: {e}. Attempting to reconnect...")
+            print(f"Stream lost: {e}. Attempting to reconnect...")
             continue
         finally:
             if connection.is_open:

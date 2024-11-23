@@ -27,7 +27,7 @@ channel.queue_bind(exchange=exchange_name, queue=queue_name, routing_key=queue_n
 
 # Создаем сообщение
 message = {
-    "key": "phone:9935315668",
+    "key": "phone:9999999999999",
     "value": {
         "field1": "value3",
         "field2": "value2"
