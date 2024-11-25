@@ -5,6 +5,8 @@ import clickhouse_connect
 import json
 import time
 from threading import Thread
+import pytz
+import requests
 from dotenv import dotenv_values
 import psycopg2
 from psycopg2.extras import RealDictCursor
@@ -43,7 +45,21 @@ redis_client = redis.StrictRedis(
     decode_responses=True
 )
 
+API_TOKEN = config.get('API_TOKEN')
+CHAT_ID = config.get('CHAT_ID')
+
 last_message_time = time.time()
+
+
+def send_telegram_message(message):
+    url = f'https://api.telegram.org/bot{API_TOKEN}/sendMessage'
+    data = {'chat_id': CHAT_ID, 'text': message}
+    try:
+        response = requests.post(url, data=data)
+        if response.status_code != 200:
+            print(f"Ошибка отправки уведомления: {response.status_code}, {response.text}")
+    except Exception as e:
+        print(f"Ошибка при отправке уведомления: {e}")
 
 
 def log_to_clickhouse(client, key, message_data, status='success', error=None):
@@ -51,7 +67,10 @@ def log_to_clickhouse(client, key, message_data, status='success', error=None):
     message_data_str = json.dumps(message_data).replace("'", "''")
     status_str = str(status) if status else 'unknown'
     error_str = str(error).replace("'", "''") if error else ''
-    timestamp = datetime.datetime.now().isoformat()
+
+    # Устанавливаем часовой пояс GMT+5
+    timezone = pytz.timezone('Etc/GMT-5')
+    timestamp = datetime.datetime.now(timezone).strftime('%Y-%m-%d %H:%M:%S')
 
     query = f"""
     INSERT INTO rabbitmq.logs (key, payload, status, error, timestamp)
@@ -72,7 +91,8 @@ def check_rbt_status(phone):
             port=POSTGRES_PORT,
             database=POSTGRES_DATABASE,
             user=POSTGRES_USER,
-            password=POSTGRES_PASSWORD
+            password=POSTGRES_PASSWORD,
+            sslmode='disable'
         )
         with connection.cursor(cursor_factory=RealDictCursor) as cursor:
             query = f"SELECT last_seen, auth_token, house_subscriber_id FROM houses_subscribers_mobile WHERE id = '7{phone}';"
@@ -92,6 +112,7 @@ def check_rbt_status(phone):
                     return None
 
     except Exception as e:
+        send_telegram_message(e)
         print(f"Error querying RBT database: {e}")
         return False
     finally:
@@ -153,9 +174,11 @@ def process_message(ch, method, properties, body, redis_client, clickhouse_clien
         else:
             error_message = f"Failed to {'insert' if status == 'failed_to_insert' else 'update' if status == 'failed_to_update' else 'replace'} message in Redis."
             log_to_clickhouse(clickhouse_client, key, message_data, status='error', error=error_message)
+            send_telegram_message(error_message)
 
     except Exception as e:
         print(f"Error processing message: {e}")
+        send_telegram_message(e)
         log_to_clickhouse(clickhouse_client, key, message_data, status='error', error=str(e))
 
 
@@ -231,3 +254,4 @@ def main():
 
 if __name__ == '__main__':
     main()
+    # print(check_rbt_status('99999999999999'))

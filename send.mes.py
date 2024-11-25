@@ -27,12 +27,14 @@ channel.queue_bind(exchange=exchange_name, queue=queue_name, routing_key=queue_n
 
 # Создаем сообщение
 message = {
-    "key": "phone:9935315668",
+    "key": "test1:test000",
     "value": {
         "field1": "value3",
-        "field2": "value2"
+        'New': 'test'
     },
     "createIfNot": True,
+    'ttl': 500,
+    'replace': True
 }
 
 # Преобразуем сообщение в JSON
