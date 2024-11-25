@@ -172,7 +172,7 @@ def process_message(ch, method, properties, body, redis_client, clickhouse_clien
             log_to_clickhouse(clickhouse_client, key, message_data, status=status)
             ch.basic_ack(delivery_tag=method.delivery_tag)
         else:
-            error_message = f"Failed to {'insert' if status == 'failed_to_insert' else 'update' if status == 'failed_to_update' else 'replace'} message in Redis."
+            error_message = f"Failed to {'insert' if status == 'failed_to_insert' else 'update' if status == 'failed_to_update' else 'replace' if status == 'failed_to_replace' else 'to process'} message in Redis."
             log_to_clickhouse(clickhouse_client, key, message_data, status='error', error=error_message)
             send_telegram_message(error_message)
 
