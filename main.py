@@ -254,7 +254,6 @@ def process_message(
             ch.basic_ack(delivery_tag=method.delivery_tag)
         else:
             error_message = f"Failed to process message for key {key}: {status}"
-            logger.error(error_message)
             log_to_clickhouse(
                 clickhouse_client,
                 key,
