@@ -254,6 +254,7 @@ def process_message(
             ch.basic_ack(delivery_tag=method.delivery_tag)
         else:
             error_message = f"Failed to process message for key {key}: {status}"
+            logger.info(error_message)
             log_to_clickhouse(
                 clickhouse_client,
                 key,
@@ -261,7 +262,6 @@ def process_message(
                 status="error",
                 error=error_message,
             )
-            send_telegram_message(f"redis_consumer: {error_message}")
             ch.basic_nack(delivery_tag=method.delivery_tag, requeue=False)
 
     except Exception as e:
