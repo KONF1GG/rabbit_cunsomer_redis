@@ -1,0 +1,7 @@
+services:
+  main_redis_consumer:
+    build: .
+    container_name: redis_consumer
+    restart: unless-stopped
+    env_file:
+      - ./.env
