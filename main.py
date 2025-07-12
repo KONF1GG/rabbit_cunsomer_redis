@@ -377,7 +377,6 @@ def main() -> None:
                     logger.info("RabbitMQ connection closed")
         except Exception as e:
             logger.error(f"Unexpected error in main loop: {e}")
-            send_telegram_message(f"redis_consumer: Unexpected error: {e}")
             time.sleep(5)
 
 
