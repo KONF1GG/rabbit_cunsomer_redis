@@ -20,7 +20,7 @@ from psycopg2.extras import RealDictCursor
 def setup_logging():
     """Настройка системы логирования"""
     logging.basicConfig(
-        level=logging.INFO,
+        level=logging.DEBUG,
         format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
         handlers=[
             logging.FileHandler("consumer.log"),
