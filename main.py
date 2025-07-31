@@ -132,6 +132,18 @@ def log_to_clickhouse(
         logger.error(f"Ошибка при записи в ClickHouse: {e}")
 
 
+def validate_and_convert_fields(data: Dict[str, Any]) -> Dict[str, Any]:
+    """Проверяет и преобразует указанные поля в строковый формат"""
+    fields_to_convert = ["vlan", "mac", "ip_addr", "onu_mac"]
+
+    for field in fields_to_convert:
+        if field in data and isinstance(data[field], (int, float)):
+            data[field] = str(data[field])
+            logger.debug(f"Converted field {field} to string")
+
+    return data
+
+
 def check_rbt_status(phone: str) -> Optional[Dict[str, Any]]:
     """
     Проверяет статус RBT для заданного номера телефона в базе данных.
@@ -209,6 +221,7 @@ def process_message(
 
     try:
         value = message_data.get("value", {})
+        value = validate_and_convert_fields(value)
         status = None
 
         # Проверяем ключ на соответствие phone:...
