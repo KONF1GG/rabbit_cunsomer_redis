@@ -340,6 +340,25 @@ def _enrich_phone_data(key: str, value: Dict[str, Any]) -> None:
             logger.debug("No RBT data for phone %s", phone)
 
 
+def _should_check_services(key: str, value: Dict[str, Any]) -> bool:
+    """
+    Определяет, нужно ли вызывать API для проверки сервисов.
+    """
+    # Проверяем, что ключ начинается с "login:"
+    if not key.startswith("login:"):
+        return False
+
+    # Список полей, при наличии хотя бы одного из которых нужно вызвать API
+    trigger_fields = ["servicecats", "speed", "password", "vlan", "onu_mac", "mac"]
+
+    # Проверяем наличие хотя бы одного из полей
+    for field in trigger_fields:
+        if field in value:
+            return True
+
+    return False
+
+
 def _process_redis_operation(
     redis_conn,
     key: str,
@@ -404,10 +423,6 @@ def _handle_processing_result(
     if status in {STATUS_INSERTED, STATUS_UPDATED, STATUS_REPLACED}:
         logger.info("Successfully %s key: %s", status, key)
         log_to_clickhouse(clickhouse_client, key, message_data, status=status)
-
-        # Проверяем включенные сервисы для ключей login
-        check_enabled_services(key)
-
         ch.basic_ack(delivery_tag=method.delivery_tag)
     else:
         error_message = f"Failed to process message for key {key}: {status}"
@@ -468,6 +483,13 @@ def process_message(
         status = _process_redis_operation(
             redis_conn, key, value, create_if_not, replace, ttl
         )
+
+        # Проверяем, нужно ли вызывать API для проверки сервисов
+        if _should_check_services(key, value):
+            logger.debug("Calling API for key %s - trigger field present", key)
+            check_enabled_services(key)
+        else:
+            logger.debug("Skipping API call for key %s - no trigger fields", key)
 
         # Обработка результата
         _handle_processing_result(
