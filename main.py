@@ -390,20 +390,22 @@ def _process_redis_operation(
         # Получаем существующие данные для сравнения
         current_value = redis_conn.json().get(key)
 
-        # Сравниваем поля onu_mac, mac, vlan
+        # Сравниваем поля onu_mac, mac, vlan только если они присутствуют в новом value
         fields_to_compare = ["onu_mac", "mac", "vlan"]
         for field in fields_to_compare:
-            old_value = current_value.get(field)
-            new_value = value.get(field)
-            if old_value != new_value:
-                fields_changed = True
-                logger.debug(
-                    "Field %s changed for key %s: %s -> %s",
-                    field,
-                    key,
-                    old_value,
-                    new_value,
-                )
+            # Проверяем только если поле присутствует в новом value
+            if field in value:
+                old_value = current_value.get(field)
+                new_value = value.get(field)
+                if old_value != new_value:
+                    fields_changed = True
+                    logger.debug(
+                        "Field %s changed for key %s: %s -> %s",
+                        field,
+                        key,
+                        old_value,
+                        new_value,
+                    )
 
         if replace:
             # Полностью заменить данные
