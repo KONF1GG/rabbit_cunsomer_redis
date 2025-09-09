@@ -153,16 +153,19 @@ def send_telegram_message(message: str) -> None:
         logger.error("Ошибка при отправке уведомления в Telegram: %s", e)
 
 
-def check_enabled_services(key: str) -> None:
+def check_enabled_services(key: str, fields_changed: bool = False) -> None:
     """
     Вызывает сервис для проверки включенных сервисов после успешного обновления данных login.
 
+    Args:
+        key: Ключ для проверки
+        fields_changed: Флаг, указывающий, что изменились критические поля (onu_mac, mac, vlan)
     """
     if not key.startswith("login:"):
         return
 
     try:
-        payload = {"key": key}
+        payload = {"key": key, "fields_changed": fields_changed}
         response = requests.post(
             app_config.api_endpoint,
             json=payload,
@@ -366,7 +369,7 @@ def _process_redis_operation(
     create_if_not: bool,
     replace: bool,
     ttl: Optional[int],
-) -> str:
+) -> Dict[str, Any]:
     """
     Выполняет операцию с Redis (вставка, обновление или замена).
 
@@ -379,31 +382,52 @@ def _process_redis_operation(
         ttl: Время жизни ключа
 
     Returns:
-        Статус операции
+        Словарь с результатом операции: {"status": str, "fields_changed": bool}
     """
+    fields_changed = False
+
     if redis_conn.exists(key):
+        # Получаем существующие данные для сравнения
+        current_value = redis_conn.json().get(key)
+
+        # Сравниваем поля onu_mac, mac, vlan
+        fields_to_compare = ["onu_mac", "mac", "vlan"]
+        for field in fields_to_compare:
+            old_value = current_value.get(field)
+            new_value = value.get(field)
+            if old_value != new_value:
+                fields_changed = True
+                logger.debug(
+                    "Field %s changed for key %s: %s -> %s",
+                    field,
+                    key,
+                    old_value,
+                    new_value,
+                )
+
         if replace:
             # Полностью заменить данные
             success = redis_conn.json().set(key, ".", value)
             if ttl and success:
                 redis_conn.expire(key, ttl)
-            return STATUS_REPLACED if success else STATUS_FAILED_REPLACE
+            status = STATUS_REPLACED if success else STATUS_FAILED_REPLACE
         else:
             # Обновить существующие данные
-            current_value = redis_conn.json().get(key)
             current_value.update(value)
             success = redis_conn.json().set(key, ".", current_value)
             if ttl and success:
                 redis_conn.expire(key, ttl)
-            return STATUS_UPDATED if success else STATUS_FAILED_UPDATE
+            status = STATUS_UPDATED if success else STATUS_FAILED_UPDATE
     else:
         if create_if_not:
             success = redis_conn.json().set(key, ".", value)
             if ttl and success:
                 redis_conn.expire(key, ttl)
-            return STATUS_INSERTED if success else STATUS_FAILED_INSERT
+            status = STATUS_INSERTED if success else STATUS_FAILED_INSERT
         else:
-            return STATUS_SKIPPED
+            status = STATUS_SKIPPED
+
+    return {"status": status, "fields_changed": fields_changed}
 
 
 def _handle_processing_result(
@@ -480,16 +504,31 @@ def process_message(
         replace = message_data.get("replace", False)
 
         # Выполнение операции с Redis
-        status = _process_redis_operation(
+        result = _process_redis_operation(
             redis_conn, key, value, create_if_not, replace, ttl
         )
+        status = result["status"]
+        fields_changed = result["fields_changed"]
+
+        # Логируем информацию об изменении полей
+        if fields_changed:
+            logger.info("Fields onu_mac, mac, or vlan changed for key: %s", key)
+        else:
+            logger.debug("No changes in onu_mac, mac, vlan fields for key: %s", key)
 
         # Проверяем, нужно ли вызывать API для проверки сервисов
-        if _should_check_services(key, value):
-            logger.debug("Calling API for key %s - trigger field present", key)
-            check_enabled_services(key)
+        # Вызываем API если есть триггерные поля ИЛИ если изменились критические поля
+        if _should_check_services(key, value) or fields_changed:
+            if fields_changed:
+                logger.info("Calling API for key %s - critical fields changed", key)
+            else:
+                logger.debug("Calling API for key %s - trigger field present", key)
+            check_enabled_services(key, fields_changed)
         else:
-            logger.debug("Skipping API call for key %s - no trigger fields", key)
+            logger.debug(
+                "Skipping API call for key %s - no trigger fields and no critical changes",
+                key,
+            )
 
         # Обработка результата
         _handle_processing_result(
@@ -503,9 +542,8 @@ def process_message(
         log_to_clickhouse(
             clickhouse_client, key, message_data, status=STATUS_ERROR, error=str(e)
         )
-        # При потере соединения не пытаемся подтвердить или отклонить сообщение
-        # Оно будет обработано заново после переподключения
-        raise  # Пробрасываем исключение для переподключения
+        ch.basic_nack(delivery_tag=method.delivery_tag, requeue=True)
+
     except Exception as e:
         error_message = f"Error processing message for key {key}: {e}"
         logger.error(error_message)
