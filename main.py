@@ -47,7 +47,7 @@ STATUS_SUCCESS = "success"
 def setup_logging():
     """Настройка системы логирования"""
     logging.basicConfig(
-        level=logging.INFO,
+        level=logging.DEBUG,
         format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
         handlers=[
             logging.FileHandler("consumer.log"),
@@ -166,6 +166,12 @@ def check_enabled_services(key: str, fields_changed: bool = False) -> None:
 
     try:
         payload = {"key": key, "fields_changed": fields_changed}
+        logger.info(
+            "Calling API check_enabled_services with payload: %s for key: %s",
+            payload,
+            key,
+        )
+
         response = requests.post(
             app_config.api_endpoint,
             json=payload,
@@ -355,9 +361,18 @@ def _should_check_services(key: str, value: Dict[str, Any]) -> bool:
     trigger_fields = ["servicecats", "speed", "password", "vlan", "onu_mac", "mac"]
 
     # Проверяем наличие хотя бы одного из полей
+    present_trigger_fields = []
     for field in trigger_fields:
         if field in value:
-            return True
+            present_trigger_fields.append(field)
+
+    if present_trigger_fields:
+        logger.debug(
+            "Trigger fields present for key %s: %s",
+            key,
+            ", ".join(present_trigger_fields),
+        )
+        return True
 
     return False
 
@@ -392,6 +407,7 @@ def _process_redis_operation(
 
         # Сравниваем поля onu_mac, mac, vlan только если они присутствуют в новом value
         fields_to_compare = ["onu_mac", "mac", "vlan"]
+        changed_fields = []
         for field in fields_to_compare:
             # Проверяем только если поле присутствует в новом value
             if field in value:
@@ -399,6 +415,7 @@ def _process_redis_operation(
                 new_value = value.get(field)
                 if old_value != new_value:
                     fields_changed = True
+                    changed_fields.append(field)
                     logger.debug(
                         "Field %s changed for key %s: %s -> %s",
                         field,
@@ -406,6 +423,14 @@ def _process_redis_operation(
                         old_value,
                         new_value,
                     )
+
+        # Логируем общую информацию об изменении критических полей
+        if changed_fields:
+            logger.info(
+                "Critical fields changed for key %s: %s",
+                key,
+                ", ".join(changed_fields),
+            )
 
         if replace:
             # Полностью заменить данные
@@ -512,19 +537,28 @@ def process_message(
         status = result["status"]
         fields_changed = result["fields_changed"]
 
+        # Проверяем, нужно ли вызывать API для проверки сервисов
+        should_call_api = _should_check_services(key, value)
+
         # Логируем информацию об изменении полей
         if fields_changed:
-            logger.info("Fields onu_mac, mac, or vlan changed for key: %s", key)
+            logger.info("Critical fields (onu_mac, mac, vlan) changed for key: %s", key)
         else:
-            logger.debug("No changes in onu_mac, mac, vlan fields for key: %s", key)
+            logger.debug(
+                "No changes in critical fields (onu_mac, mac, vlan) for key: %s", key
+            )
 
-        # Проверяем, нужно ли вызывать API для проверки сервисов
         # Вызываем API если есть триггерные поля ИЛИ если изменились критические поля
-        if _should_check_services(key, value) or fields_changed:
-            if fields_changed:
+        if should_call_api or fields_changed:
+            if fields_changed and should_call_api:
+                logger.info(
+                    "Calling API for key %s - both trigger fields present AND critical fields changed",
+                    key,
+                )
+            elif fields_changed:
                 logger.info("Calling API for key %s - critical fields changed", key)
             else:
-                logger.debug("Calling API for key %s - trigger field present", key)
+                logger.info("Calling API for key %s - trigger fields present", key)
             check_enabled_services(key, fields_changed)
         else:
             logger.debug(
