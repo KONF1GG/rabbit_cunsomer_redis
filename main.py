@@ -275,6 +275,14 @@ def check_rbt_status(phone: str) -> Optional[Dict[str, Any]]:
 
             if result:
                 last_seen = result["last_seen"]
+
+                # Check if last_seen is None (NULL in database)
+                if last_seen is None:
+                    logger.debug(
+                        "RBT status found for phone %s: no last_seen data", phone
+                    )
+                    return None
+
                 last_seen = datetime.datetime.fromtimestamp(last_seen)
 
                 # Сравнение с текущей датой минус 90 дней
@@ -283,6 +291,16 @@ def check_rbt_status(phone: str) -> Optional[Dict[str, Any]]:
                 )
                 if last_seen > three_months_ago:
                     logger.debug("RBT status found for phone %s: active", phone)
+                    # Ensure auth_token and house_subscriber_id are not None
+                    if (
+                        result.get("auth_token") is None
+                        or result.get("house_subscriber_id") is None
+                    ):
+                        logger.debug(
+                            "RBT status found for phone %s: missing required fields (auth_token or house_subscriber_id)",
+                            phone,
+                        )
+                        return None
                     return result
                 else:
                     logger.debug(

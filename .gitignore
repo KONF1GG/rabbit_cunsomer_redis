@@ -2,3 +2,4 @@
 .env
 .idea/
 venv
+consumer.log
