@@ -376,7 +376,15 @@ def _should_check_services(key: str, value: Dict[str, Any]) -> bool:
         return False
 
     # Список полей, при наличии хотя бы одного из которых нужно вызвать API
-    trigger_fields = ["servicecats", "speed", "password", "vlan", "onu_mac", "mac", "ip_addr"]
+    trigger_fields = [
+        "servicecats",
+        "speed",
+        "password",
+        "vlan",
+        "onu_mac",
+        "mac",
+        "ip_addr",
+    ]
 
     # Проверяем наличие хотя бы одного из полей
     present_trigger_fields = []
@@ -423,7 +431,7 @@ def _process_redis_operation(
         # Получаем существующие данные для сравнения
         current_value = redis_conn.json().get(key)
 
-        # Сравниваем поля onu_mac, mac, vlan только если они присутствуют в новом value
+        # Сравниваем критические поля onu_mac, mac, vlan, ip_addr только если они присутствуют в новом value
         fields_to_compare = ["onu_mac", "mac", "vlan", "ip_addr"]
         changed_fields = []
         for field in fields_to_compare:
@@ -442,7 +450,7 @@ def _process_redis_operation(
                         new_value,
                     )
 
-        # Логируем общую информацию об изменении критических полей
+        # Логируем общую информацию об изменении критических полей (onu_mac, mac, vlan, ip_addr)
         if changed_fields:
             logger.info(
                 "Critical fields changed for key %s: %s",
@@ -560,10 +568,13 @@ def process_message(
 
         # Логируем информацию об изменении полей
         if fields_changed:
-            logger.info("Critical fields (onu_mac, mac, vlan) changed for key: %s", key)
+            logger.info(
+                "Critical fields (onu_mac, mac, vlan, ip_addr) changed for key: %s", key
+            )
         else:
             logger.debug(
-                "No changes in critical fields (onu_mac, mac, vlan) for key: %s", key
+                "No changes in critical fields (onu_mac, mac, vlan, ip_addr) for key: %s",
+                key,
             )
 
         # Вызываем API если есть триггерные поля ИЛИ если изменились критические поля
