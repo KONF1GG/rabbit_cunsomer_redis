@@ -3,6 +3,7 @@
 import datetime
 import json
 import logging
+import re
 import sys
 import time
 from threading import Thread
@@ -81,6 +82,10 @@ class Config:
         self.rabbit_user: str = self._get_required_config(config, "RABBIT_USER")
         self.rabbit_password: str = self._get_required_config(config, "RABBIT_PASSWORD")
         self.queue_name: str = self._get_required_config(config, "QUEUE_NAME")
+
+        # Настройки Exchange для отправки сообщений с request_id
+        self.exchange_name: str = config.get("EXCHANGE_NAME", "responses")
+        self.exchange_type: str = config.get("EXCHANGE_TYPE", "topic")
 
         # Настройки Redis
         self.redis_host: str = self._get_required_config(config, "REDIS_HOST")
@@ -367,6 +372,109 @@ def _enrich_phone_data(key: str, value: Dict[str, Any]) -> None:
             logger.debug("No RBT data for phone %s", phone)
 
 
+def _parse_request_id(request_id: str) -> Optional[str]:
+    """
+    Парсит request_id и извлекает routing_key.
+
+    Args:
+        request_id: Строка в формате "routing_key_uuid"
+
+    Returns:
+        routing_key или None если не удалось распарсить
+    """
+    if not request_id:
+        return None
+
+    # UUID pattern для поиска UUID в конце строки
+    uuid_pattern = r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+
+    # Ищем UUID в конце строки
+    match = re.search(uuid_pattern, request_id, re.IGNORECASE)
+    if match:
+        # Извлекаем routing_key (все что до UUID)
+        routing_key = request_id[: match.start()].rstrip("_")
+        logger.debug(
+            "Parsed routing_key '%s' from request_id '%s'", routing_key, request_id
+        )
+        return routing_key
+
+    logger.warning("Could not parse routing_key from request_id: %s", request_id)
+    return None
+
+
+def _create_response_message(
+    original_message: Dict[str, Any],
+    success: bool,
+    error_message: Optional[str] = None,
+) -> Dict[str, Any]:
+    """
+    Создает простой ответ для отправки в exchange.
+
+    Args:
+        original_message: Исходное сообщение
+        success: Успешность операции
+        error_message: Сообщение об ошибке (если есть)
+
+    Returns:
+        Словарь с ответом
+    """
+    response = {
+        "request_id": original_message.get("request_id"),
+        "success": success,
+        "timestamp": datetime.datetime.now(pytz.timezone(TIMEZONE)).isoformat(),
+    }
+
+    if error_message:
+        response["error"] = error_message
+
+    return response
+
+
+def _publish_response_to_exchange(
+    channel, response_data: Dict[str, Any], routing_key: str
+) -> None:
+    """
+    Отправляет ответ в exchange с указанным routing_key.
+
+    Args:
+        channel: Канал RabbitMQ
+        response_data: Данные ответа
+        routing_key: Ключ маршрутизации
+    """
+    try:
+        # Объявляем exchange если не существует
+        channel.exchange_declare(
+            exchange=app_config.exchange_name,
+            exchange_type=app_config.exchange_type,
+            durable=True,
+        )
+
+        # Отправляем ответ
+        message_body = json.dumps(response_data)
+        channel.basic_publish(
+            exchange=app_config.exchange_name,
+            routing_key=routing_key,
+            body=message_body,
+            properties=pika.BasicProperties(
+                delivery_mode=2,  # Сделать сообщение постоянным
+                content_type="application/json",
+            ),
+        )
+
+        logger.info(
+            "Published response to exchange '%s' with routing_key '%s', success: %s",
+            app_config.exchange_name,
+            routing_key,
+            response_data.get("success"),
+        )
+
+    except Exception as e:
+        logger.error("Failed to publish response to exchange: %s", e)
+        send_telegram_message(
+            f"redis_consumer: Failed to publish response to exchange: {e}"
+        )
+
+
 def _should_check_services(key: str, value: Dict[str, Any]) -> bool:
     """
     Определяет, нужно ли вызывать API для проверки сервисов.
@@ -487,7 +595,7 @@ def _handle_processing_result(
     ch, method, key: str, status: str, message_data: Dict[str, Any], clickhouse_client
 ) -> None:
     """
-    Обрабатывает результат операции с Redis.
+    Обрабатывает результат операции с Redis и отправляет ответ в exchange если есть request_id.
 
     Args:
         ch: Канал RabbitMQ
@@ -497,7 +605,29 @@ def _handle_processing_result(
         message_data: Данные сообщения
         clickhouse_client: Клиент ClickHouse
     """
-    if status in {STATUS_INSERTED, STATUS_UPDATED, STATUS_REPLACED}:
+    success = status in {STATUS_INSERTED, STATUS_UPDATED, STATUS_REPLACED}
+
+    # Отправляем ответ в exchange если есть request_id
+    request_id = message_data.get("request_id")
+    if request_id:
+        routing_key = _parse_request_id(request_id)
+        if routing_key:
+            error_message = None
+            if not success:
+                error_message = f"Failed to process message for key {key}: {status}"
+
+            response_data = _create_response_message(
+                original_message=message_data,
+                success=success,
+                error_message=error_message,
+            )
+            _publish_response_to_exchange(ch, response_data, routing_key)
+        else:
+            logger.warning(
+                "Could not parse routing_key from request_id: %s", request_id
+            )
+
+    if success:
         logger.info("Successfully %s key: %s", status, key)
         log_to_clickhouse(clickhouse_client, key, message_data, status=status)
         ch.basic_ack(delivery_tag=method.delivery_tag)
@@ -635,12 +765,25 @@ def setup_rabbitmq_channel():
                 )
             )
             channel = connection.channel()
+
+            # Объявляем очередь
             channel.queue_declare(
                 queue=app_config.queue_name,
                 durable=True,
                 arguments={"x-message-ttl": DEFAULT_TTL},
             )
-            logger.info("Successfully connected to RabbitMQ")
+
+            # Объявляем exchange для отправки сообщений с request_id
+            channel.exchange_declare(
+                exchange=app_config.exchange_name,
+                exchange_type=app_config.exchange_type,
+                durable=True,
+            )
+
+            logger.info(
+                "Successfully connected to RabbitMQ and declared exchange '%s'",
+                app_config.exchange_name,
+            )
             return connection, channel
         except (ConnectionClosed, StreamLostError) as e:
             logger.error(
