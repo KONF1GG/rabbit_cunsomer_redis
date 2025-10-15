@@ -85,7 +85,7 @@ class Config:
 
         # Настройки Exchange для отправки сообщений с request_id
         self.exchange_name: str = config.get("EXCHANGE_NAME", "responses")
-        self.exchange_type: str = config.get("EXCHANGE_TYPE", "topic")
+        self.exchange_type: str = config.get("EXCHANGE_TYPE", "direct")
 
         # Настройки Redis
         self.redis_host: str = self._get_required_config(config, "REDIS_HOST")
