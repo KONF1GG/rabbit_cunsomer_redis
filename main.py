@@ -18,6 +18,7 @@ import requests
 from dotenv import dotenv_values
 from pika.exceptions import ConnectionClosed, StreamLostError, AMQPConnectionError
 from psycopg2.extras import RealDictCursor
+from prometheus_client import start_http_server, Counter, Gauge, Histogram
 
 # Constants
 DEFAULT_TTL = 86400000  # 24 hours in milliseconds
@@ -113,6 +114,10 @@ class Config:
         # Настройки API
         self.api_endpoint: str = f"{config.get('API')}/check_and_correct_services/"
 
+        # Metrics HTTP server port (Prometheus)
+        _metrics_port_val = config.get("METRICS_PORT")
+        self.metrics_port: int = int(_metrics_port_val) if _metrics_port_val else 8001
+
     def _get_required_config(self, config: Dict[str, Optional[str]], key: str) -> str:
         """
         Получает обязательный параметр конфигурации.
@@ -135,6 +140,49 @@ redis_client = redis.StrictRedis(
 )
 
 last_message_time = time.time()
+
+# Prometheus metrics (initialized after config)
+messages_processed_total = Counter(
+    "redis_consumer_messages_processed_total",
+    "Total processed messages",
+    ["status"],
+)
+
+messages_processing_duration_seconds = Histogram(
+    "redis_consumer_processing_duration_seconds",
+    "Message processing duration in seconds",
+)
+
+redis_operations_total = Counter(
+    "redis_consumer_redis_operations_total",
+    "Redis operations total",
+    ["operation"],
+)
+
+messages_failed_total = Counter(
+    "redis_consumer_messages_failed_total",
+    "Total failed messages",
+)
+
+last_message_timestamp = Gauge(
+    "redis_consumer_last_message_timestamp",
+    "Unix timestamp of last processed message",
+)
+
+rabbitmq_connection_up = Gauge(
+    "redis_consumer_rabbitmq_up",
+    "RabbitMQ connection status (1 up, 0 down)",
+)
+
+redis_up = Gauge(
+    "redis_consumer_redis_up",
+    "Redis connection status (1 up, 0 down)",
+)
+
+clickhouse_up = Gauge(
+    "redis_consumer_clickhouse_up",
+    "ClickHouse connection status (1 up, 0 down)",
+)
 
 
 def send_telegram_message(message: str) -> None:
@@ -214,6 +262,9 @@ def log_to_clickhouse(
         status: Статус обработки
         error: Текст ошибки (если есть)
     """
+    # If ClickHouse client is not available, skip logging
+    if not client:
+        return
     try:
         key_str = str(key) if key else ""
         message_data_str = json.dumps(message_data)
@@ -630,6 +681,23 @@ def _handle_processing_result(
     if success:
         logger.info("Successfully %s key: %s", status, key)
         log_to_clickhouse(clickhouse_client, key, message_data, status=status)
+        # Metrics: successful message processed
+        try:
+            messages_processed_total.labels(status=status).inc()
+            # Increment redis operation counters depending on status
+            if status == STATUS_INSERTED:
+                redis_operations_total.labels(operation="inserted").inc()
+            elif status == STATUS_UPDATED:
+                redis_operations_total.labels(operation="updated").inc()
+            elif status == STATUS_REPLACED:
+                redis_operations_total.labels(operation="replaced").inc()
+        except Exception:
+            logger.debug("Failed to update success metrics")
+        # update last message timestamp metric
+        try:
+            last_message_timestamp.set(time.time())
+        except Exception:
+            pass
         ch.basic_ack(delivery_tag=method.delivery_tag)
     else:
         error_message = f"Failed to process message for key {key}: {status}"
@@ -641,6 +709,11 @@ def _handle_processing_result(
             status=STATUS_ERROR,
             error=error_message,
         )
+        try:
+            messages_failed_total.inc()
+            messages_processed_total.labels(status=STATUS_ERROR).inc()
+        except Exception:
+            logger.debug("Failed to update failure metrics")
         ch.basic_nack(delivery_tag=method.delivery_tag, requeue=False)
 
 
@@ -660,9 +733,16 @@ def process_message(
     """
     global last_message_time
     last_message_time = time.time()
+    # Metrics: update last message timestamp as soon as we start processing
+    try:
+        last_message_timestamp.set(time.time())
+    except Exception:
+        pass
 
     # Парсинг сообщения
-    message_data = _parse_message_body(body)
+    # Time the processing using Prometheus histogram
+    with messages_processing_duration_seconds.time():
+        message_data = _parse_message_body(body)
     if not message_data:
         ch.basic_nack(delivery_tag=method.delivery_tag, requeue=False)
         return
@@ -737,6 +817,11 @@ def process_message(
         log_to_clickhouse(
             clickhouse_client, key, message_data, status=STATUS_ERROR, error=str(e)
         )
+        try:
+            messages_failed_total.inc()
+            messages_processed_total.labels(status=STATUS_ERROR).inc()
+        except Exception:
+            pass
         ch.basic_nack(delivery_tag=method.delivery_tag, requeue=True)
 
     except Exception as e:
@@ -784,6 +869,10 @@ def setup_rabbitmq_channel():
                 "Successfully connected to RabbitMQ and declared exchange '%s'",
                 app_config.exchange_name,
             )
+            try:
+                rabbitmq_connection_up.set(1)
+            except Exception:
+                pass
             return connection, channel
         except (ConnectionClosed, StreamLostError) as e:
             logger.error(
@@ -791,6 +880,10 @@ def setup_rabbitmq_channel():
                 e,
                 RECONNECT_DELAY,
             )
+            try:
+                rabbitmq_connection_up.set(0)
+            except Exception:
+                pass
             time.sleep(RECONNECT_DELAY)
         except AMQPConnectionError as e:
             logger.error(
@@ -798,6 +891,10 @@ def setup_rabbitmq_channel():
                 e,
                 RECONNECT_DELAY,
             )
+            try:
+                rabbitmq_connection_up.set(0)
+            except Exception:
+                pass
             time.sleep(RECONNECT_DELAY)
         except Exception as e:
             logger.error(
@@ -805,6 +902,10 @@ def setup_rabbitmq_channel():
                 e,
                 RECONNECT_DELAY,
             )
+            try:
+                rabbitmq_connection_up.set(0)
+            except Exception:
+                pass
             time.sleep(RECONNECT_DELAY)
 
 
@@ -832,21 +933,48 @@ def main() -> None:
 
     logger.info("Starting Redis Consumer application...")
 
+    # Start Prometheus metrics HTTP server first (should not block the app if CH is down)
+    try:
+        start_http_server(app_config.metrics_port)
+        logger.info(
+            "Prometheus metrics server started on port %s", app_config.metrics_port
+        )
+    except Exception as e:
+        logger.warning("Failed to start Prometheus HTTP server: %s", e)
+
+    # Try to connect to ClickHouse, but continue even if it fails
+    clickhouse_client = None
     try:
         clickhouse_client = clickhouse_connect.get_client(
             host=app_config.clickhouse_host,
             username=app_config.clickhouse_user,
             password=app_config.clickhouse_password,
         )
+        clickhouse_up.set(1)
         logger.info("Connected to ClickHouse")
     except Exception as e:
         logger.error("Failed to connect to ClickHouse: %s", e)
-        send_telegram_message(f"redis_consumer: Failed to connect to ClickHouse: {e}")
-        return
+        try:
+            clickhouse_up.set(0)
+        except Exception:
+            pass
+        # Not returning here; app will continue without ClickHouse logging
 
     while True:
         try:
             connection, channel = setup_rabbitmq_channel()
+
+            # If we have a redis client, flag it as up (best-effort)
+            try:
+                if redis_client.ping():
+                    redis_up.set(1)
+                else:
+                    redis_up.set(0)
+            except Exception:
+                try:
+                    redis_up.set(0)
+                except Exception:
+                    pass
 
             def callback(ch, method, properties, body):
                 try:

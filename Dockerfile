@@ -6,4 +6,7 @@ COPY . .
 
 RUN pip install --no-cache-dir -r req.txt
 
+# Expose Prometheus metrics port
+EXPOSE 8001
+
 CMD ["python", "main.py"]
