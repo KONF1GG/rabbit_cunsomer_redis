@@ -43,6 +43,8 @@ STATUS_FAILED_REPLACE = "failed_to_replace"
 STATUS_SKIPPED = "skipped"
 STATUS_ERROR = "error"
 STATUS_SUCCESS = "success"
+STATUS_DELETED = "deleted"
+STATUS_FAILED_DELETE = "failed_to_delete"
 
 
 # Настройка логирования
@@ -397,12 +399,22 @@ def _parse_message_body(body: bytes) -> Optional[Dict[str, Any]]:
 def _validate_message_data(message_data: Dict[str, Any]) -> Optional[str]:
     """
     Валидирует обязательные поля сообщения.
-
+    Теперь требует обязательное поле operation со значением 'update' или 'delete'.
     """
     key = message_data.get("key")
     if not key:
         logger.error("Message missing required 'key' field")
         return None
+
+    operation = message_data.get("operation")
+    if not operation:
+        logger.error("Message missing required 'operation' field")
+        return None
+
+    if operation not in ["update", "delete"]:
+        logger.error("Invalid operation '%s'. Must be 'update' or 'delete'", operation)
+        return None
+
     return key
 
 
@@ -421,6 +433,22 @@ def _enrich_phone_data(key: str, value: Dict[str, Any]) -> None:
         else:
             value["rbt"] = False
             logger.debug("No RBT data for phone %s", phone)
+
+
+def _delete_redis_key(redis_conn, key: str) -> bool:
+    """
+    Удаляет ключ из Redis. Возвращает True если ключ был удален или не существовал.
+    """
+    try:
+        # delete() возвращает количество удаленных ключей
+        deleted = redis_conn.delete(key)
+        logger.debug(
+            "Redis delete operation for key '%s': %s keys deleted", key, deleted
+        )
+        return True  # Успех независимо от того, существовал ключ или нет
+    except Exception as e:
+        logger.error("Error deleting key '%s' from Redis: %s", key, e)
+        return False
 
 
 def _parse_request_id(request_id: str) -> Optional[str]:
@@ -656,7 +684,12 @@ def _handle_processing_result(
         message_data: Данные сообщения
         clickhouse_client: Клиент ClickHouse
     """
-    success = status in {STATUS_INSERTED, STATUS_UPDATED, STATUS_REPLACED}
+    success = status in {
+        STATUS_INSERTED,
+        STATUS_UPDATED,
+        STATUS_REPLACED,
+        STATUS_DELETED,
+    }
 
     # Отправляем ответ в exchange если есть request_id
     request_id = message_data.get("request_id")
@@ -691,6 +724,8 @@ def _handle_processing_result(
                 redis_operations_total.labels(operation="updated").inc()
             elif status == STATUS_REPLACED:
                 redis_operations_total.labels(operation="replaced").inc()
+            elif status == STATUS_DELETED:
+                redis_operations_total.labels(operation="deleted").inc()
         except Exception:
             logger.debug("Failed to update success metrics")
         # update last message timestamp metric
@@ -722,6 +757,7 @@ def process_message(
 ) -> None:
     """
     Обработка сообщения из RabbitMQ.
+    Теперь поддерживает два типа операций: 'update' и 'delete'.
 
     Args:
         ch: Канал RabbitMQ
@@ -747,71 +783,92 @@ def process_message(
         ch.basic_nack(delivery_tag=method.delivery_tag, requeue=False)
         return
 
-    # Валидация данных
+    # Валидация данных (теперь включает проверку operation)
     key = _validate_message_data(message_data)
     if not key:
         ch.basic_nack(delivery_tag=method.delivery_tag, requeue=False)
         return
 
+    operation = message_data.get("operation")
+
     try:
-        # Подготовка данных
-        value = message_data.get("value", {})
-        value = validate_and_convert_fields(value)
+        if operation == "delete":
+            # Операция удаления - только ключ
+            logger.info("Processing DELETE operation for key: %s", key)
+            deleted_ok = _delete_redis_key(redis_conn, key)
+            status = STATUS_DELETED if deleted_ok else STATUS_FAILED_DELETE
 
-        # Обогащение данных для телефонных номеров
-        _enrich_phone_data(key, value)
-
-        # Получение параметров операции
-        create_if_not = message_data.get("createIfNot", True)
-        ttl = message_data.get("ttl", None)
-        replace = message_data.get("replace", False)
-
-        # Выполнение операции с Redis
-        result = _process_redis_operation(
-            redis_conn, key, value, create_if_not, replace, ttl
-        )
-        status = result["status"]
-        fields_changed = result["fields_changed"]
-
-        # Проверяем, нужно ли вызывать API для проверки сервисов
-        should_call_api = _should_check_services(key, value)
-
-        # Логируем информацию об изменении полей
-        if fields_changed:
-            logger.info(
-                "Critical fields (onu_mac, mac, vlan, ip_addr) changed for key: %s", key
-            )
-        else:
-            logger.debug(
-                "No changes in critical fields (onu_mac, mac, vlan, ip_addr) for key: %s",
-                key,
+            # Обработка результата удаления
+            _handle_processing_result(
+                ch, method, key, status, message_data, clickhouse_client
             )
 
-        # Вызываем API если есть триггерные поля ИЛИ если изменились критические поля
-        if should_call_api or fields_changed:
-            if fields_changed and should_call_api:
+        elif operation == "update":
+            # Операция обновления - текущий алгоритм
+            logger.info("Processing UPDATE operation for key: %s", key)
+
+            # Подготовка данных
+            value = message_data.get("value", {})
+
+            value = validate_and_convert_fields(value)
+
+            # Обогащение данных для телефонных номеров
+            _enrich_phone_data(key, value)
+
+            # Получение параметров операции
+            create_if_not = message_data.get("createIfNot", True)
+            ttl = message_data.get("ttl", None)
+            replace = message_data.get("replace", False)
+
+            # Выполнение операции с Redis
+            result = _process_redis_operation(
+                redis_conn, key, value, create_if_not, replace, ttl
+            )
+            status = result["status"]
+            fields_changed = result["fields_changed"]
+
+            # Проверяем, нужно ли вызывать API для проверки сервисов
+            should_call_api = _should_check_services(key, value)
+
+            # Логируем информацию об изменении полей
+            if fields_changed:
                 logger.info(
-                    "Calling API for key %s - both trigger fields present AND critical fields changed",
+                    "Critical fields (onu_mac, mac, vlan, ip_addr) changed for key: %s",
                     key,
                 )
-            elif fields_changed:
-                logger.info("Calling API for key %s - critical fields changed", key)
             else:
-                logger.info("Calling API for key %s - trigger fields present", key)
-            check_enabled_services(key, fields_changed)
-        else:
-            logger.debug(
-                "Skipping API call for key %s - no trigger fields and no critical changes",
-                key,
+                logger.debug(
+                    "No changes in critical fields (onu_mac, mac, vlan, ip_addr) for key: %s",
+                    key,
+                )
+
+            # Вызываем API если есть триггерные поля ИЛИ если изменились критические поля
+            if should_call_api or fields_changed:
+                if fields_changed and should_call_api:
+                    logger.info(
+                        "Calling API for key %s - both trigger fields present AND critical fields changed",
+                        key,
+                    )
+                elif fields_changed:
+                    logger.info("Calling API for key %s - critical fields changed", key)
+                else:
+                    logger.info("Calling API for key %s - trigger fields present", key)
+                check_enabled_services(key, fields_changed)
+            else:
+                logger.debug(
+                    "Skipping API call for key %s - no trigger fields and no critical changes",
+                    key,
+                )
+
+            # Обработка результата обновления
+            _handle_processing_result(
+                ch, method, key, status, message_data, clickhouse_client
             )
 
-        # Обработка результата
-        _handle_processing_result(
-            ch, method, key, status, message_data, clickhouse_client
-        )
-
     except (ConnectionClosed, StreamLostError) as e:
-        error_message = f"Connection lost while processing message for key {key}: {e}"
+        error_message = (
+            f"Connection lost while processing {operation} operation for key {key}: {e}"
+        )
         logger.error(error_message)
         send_telegram_message(f"redis_consumer: {error_message}")
         log_to_clickhouse(
@@ -825,7 +882,7 @@ def process_message(
         ch.basic_nack(delivery_tag=method.delivery_tag, requeue=True)
 
     except Exception as e:
-        error_message = f"Error processing message for key {key}: {e}"
+        error_message = f"Error processing {operation} operation for key {key}: {e}"
         logger.error(error_message)
         send_telegram_message(f"redis_consumer: {error_message}")
         log_to_clickhouse(

@@ -1,0 +1,22 @@
+2025-11-11 09:11:17,356 - __main__ - INFO - Starting Redis Consumer application...
+2025-11-11 09:11:17,364 - __main__ - INFO - Prometheus metrics server started on port 8001
+2025-11-11 09:11:17,492 - __main__ - INFO - Connected to ClickHouse
+2025-11-11 09:11:17,492 - __main__ - INFO - Attempting to connect to RabbitMQ...
+2025-11-11 09:11:17,619 - __main__ - INFO - Successfully connected to RabbitMQ and declared exchange 'responses'
+2025-11-11 09:11:17,746 - __main__ - INFO - Waiting for messages. To exit press CTRL+C
+2025-11-11 09:11:17,747 - __main__ - INFO - Processing message with key: login:ulvpn6919
+2025-11-11 09:11:23,619 - __main__ - INFO - Processing UPDATE operation for key: login:ulvpn6919
+2025-11-11 09:11:42,018 - __main__ - DEBUG - No changes in critical fields (onu_mac, mac, vlan, ip_addr) for key: login:ulvpn6919
+2025-11-11 09:11:45,451 - __main__ - DEBUG - Skipping API call for key login:ulvpn6919 - no trigger fields and no critical changes
+2025-11-11 09:11:46,783 - __main__ - INFO - Successfully updated key: login:ulvpn6919
+2025-11-11 09:11:46,825 - __main__ - DEBUG - Logged to ClickHouse: key=login:ulvpn6919, status=updated
+2025-11-11 09:11:48,968 - __main__ - INFO - Processing message with key: login:vsvpn4839
+2025-11-11 09:11:54,234 - __main__ - INFO - Processing UPDATE operation for key: login:vsvpn4839
+2025-11-11 09:12:00,352 - __main__ - DEBUG - Trigger fields present for key login:vsvpn4839: servicecats
+2025-11-11 09:12:02,602 - __main__ - DEBUG - No changes in critical fields (onu_mac, mac, vlan, ip_addr) for key: login:vsvpn4839
+2025-11-11 09:12:04,101 - __main__ - INFO - Calling API for key login:vsvpn4839 - trigger fields present
+2025-11-11 09:12:04,387 - __main__ - INFO - Calling API check_enabled_services with payload: {'key': 'login:vsvpn4839', 'fields_changed': False} for key: login:vsvpn4839
+2025-11-11 09:12:04,480 - __main__ - INFO - Successfully checked enabled services for key: login:vsvpn4839
+2025-11-11 09:12:05,567 - __main__ - INFO - Successfully updated key: login:vsvpn4839
+2025-11-11 09:12:05,611 - __main__ - DEBUG - Logged to ClickHouse: key=login:vsvpn4839, status=updated
+2025-11-11 09:12:07,418 - __main__ - INFO - Processing message with key: login:hkvpn3260

@@ -3,5 +3,3 @@
 .idea/
 venv
 consumer.log
-
-grafana_dashboard.json
