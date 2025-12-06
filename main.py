@@ -16,7 +16,12 @@ import pytz
 import redis
 import requests
 from dotenv import dotenv_values
-from pika.exceptions import ConnectionClosed, StreamLostError, AMQPConnectionError
+from pika.exceptions import (
+    ConnectionClosed,
+    StreamLostError,
+    AMQPConnectionError,
+    ChannelClosedByBroker,
+)
 from psycopg2.extras import RealDictCursor
 from prometheus_client import start_http_server, Counter, Gauge, Histogram
 
@@ -733,7 +738,16 @@ def _handle_processing_result(
             last_message_timestamp.set(time.time())
         except Exception:
             pass
-        ch.basic_ack(delivery_tag=method.delivery_tag)
+        # Only ack if channel is still open
+        try:
+            if ch and ch.is_open:
+                ch.basic_ack(delivery_tag=method.delivery_tag)
+        except (ConnectionClosed, StreamLostError, ChannelClosedByBroker):
+            logger.debug("Channel closed, cannot ack message")
+            raise  # Re-raise to trigger reconnection
+        except Exception as e:
+            logger.warning("Error acking message: %s", e)
+            raise
     else:
         error_message = f"Failed to process message for key {key}: {status}"
         logger.info(error_message)
@@ -749,7 +763,16 @@ def _handle_processing_result(
             messages_processed_total.labels(status=STATUS_ERROR).inc()
         except Exception:
             logger.debug("Failed to update failure metrics")
-        ch.basic_nack(delivery_tag=method.delivery_tag, requeue=False)
+        # Only nack if channel is still open
+        try:
+            if ch and ch.is_open:
+                ch.basic_nack(delivery_tag=method.delivery_tag, requeue=False)
+        except (ConnectionClosed, StreamLostError, ChannelClosedByBroker):
+            logger.debug("Channel closed, cannot nack message")
+            raise  # Re-raise to trigger reconnection
+        except Exception as e:
+            logger.warning("Error nacking message: %s", e)
+            raise
 
 
 def process_message(
@@ -865,10 +888,8 @@ def process_message(
                 ch, method, key, status, message_data, clickhouse_client
             )
 
-    except (ConnectionClosed, StreamLostError) as e:
-        error_message = (
-            f"Connection lost while processing {operation} operation for key {key}: {e}"
-        )
+    except (ConnectionClosed, StreamLostError, ChannelClosedByBroker) as e:
+        error_message = f"Connection/channel lost while processing {operation} operation for key {key}: {e}"
         logger.error(error_message)
         send_telegram_message(f"redis_consumer: {error_message}")
         log_to_clickhouse(
@@ -879,7 +900,14 @@ def process_message(
             messages_processed_total.labels(status=STATUS_ERROR).inc()
         except Exception:
             pass
-        ch.basic_nack(delivery_tag=method.delivery_tag, requeue=True)
+        # Only try to nack if channel is still open
+        try:
+            if ch and ch.is_open:
+                ch.basic_nack(delivery_tag=method.delivery_tag, requeue=True)
+        except Exception:
+            # Channel is already closed, message will be requeued automatically
+            logger.debug("Channel already closed, cannot nack message")
+            pass
 
     except Exception as e:
         error_message = f"Error processing {operation} operation for key {key}: {e}"
@@ -976,8 +1004,19 @@ def monitor_connection(channel) -> None:
             logger.warning(
                 "No messages received in the last 10 minutes. Reconnecting..."
             )
-            if channel.is_open:
-                channel.stop_consuming()
+            try:
+                # Check if channel is open before trying to stop consuming
+                if channel and channel.is_open:
+                    channel.stop_consuming()
+            except (ConnectionClosed, StreamLostError) as e:
+                logger.debug(
+                    "Connection already closed while stopping consumption: %s", e
+                )
+            except Exception as e:
+                # Handle all other exceptions (ChannelClosedByBroker, AssertionError, etc.)
+                logger.debug(
+                    "Error stopping consumption (channel may already be closed): %s", e
+                )
             break
         time.sleep(MONITORING_INTERVAL)
 
@@ -1038,16 +1077,20 @@ def main() -> None:
                     process_message(
                         ch, method, properties, body, redis_client, clickhouse_client
                     )
-                except (ConnectionClosed, StreamLostError) as e:
-                    logger.error("Connection lost in callback: %s. Will reconnect.", e)
+                except (ConnectionClosed, StreamLostError, ChannelClosedByBroker) as e:
+                    logger.error(
+                        "Connection/channel lost in callback: %s. Will reconnect.", e
+                    )
                     # Пробрасываем исключение для переподключения
                     raise
                 except Exception as e:
                     logger.error("Callback error: %s. Re-queueing message.", e)
                     try:
                         ch.basic_nack(delivery_tag=method.delivery_tag, requeue=True)
-                    except (ConnectionClosed, StreamLostError):
-                        logger.error("Cannot nack message due to connection loss")
+                    except (ConnectionClosed, StreamLostError, ChannelClosedByBroker):
+                        logger.error(
+                            "Cannot nack message due to connection/channel loss"
+                        )
                         raise
 
             channel.basic_consume(
@@ -1070,13 +1113,21 @@ def main() -> None:
             except StreamLostError as e:
                 logger.error("Stream lost: %s. Attempting to reconnect...", e)
                 continue
+            except ChannelClosedByBroker as e:
+                logger.error(
+                    "Channel closed by broker: %s. Attempting to reconnect...", e
+                )
+                continue
             except KeyboardInterrupt:
                 logger.info("Received keyboard interrupt. Shutting down...")
                 break
             finally:
-                if connection and connection.is_open:
-                    connection.close()
-                    logger.info("RabbitMQ connection closed")
+                try:
+                    if connection and connection.is_open:
+                        connection.close()
+                        logger.info("RabbitMQ connection closed")
+                except Exception as e:
+                    logger.debug("Error closing connection: %s", e)
         except Exception as e:
             logger.error("Unexpected error in main loop: %s", e)
             time.sleep(RECONNECT_DELAY)
